@@ -1,0 +1,748 @@
+#!/bin/bash
+# Script para crear un punto de acceso en la red local con wify.
+#
+# Copyright (C) 2013  Alin Andrei <andrew@webupd8.org>
+# Copyright (C) 2013  Satyajit sahoo
+# Copyright (C) 2016  Aldy Leon Garcia
+#
+# This scipt is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published
+# by the Free Software Foundation; either version 3 of the License,
+# or (at your option) any later version.
+#
+# The script is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this script. If not, see <http://www.gnu.org/licenses/>.
+
+#permitir el acceso a usuarios no root
+SCRIPT_UMASK=0077
+umask $SCRIPT_UMASK
+
+# Variables Globales
+
+#Usuario Actual
+user=$(who | grep $(echo "$DISPLAY" | cut -d '.' -f 1) | cut -d ' ' -f 1 | tail -1)
+
+#Metodo para mostrar mensajes en la pantalla usando DBUS
+WMPID=$(ps -u $user | tail -n 1 | awk '{print $1}')
+DBUS=$(egrep -z 'DBUS_SESSION_BUS_ADDRESS|DISPLAY' /proc/${WMPID}/environ | sed -r -e 's/(.)DBUS_/\1 DBUS_/' -e 's/(.)DISPLAY/\1 DISPLAY/')
+
+#Carpeta de configuraciones
+confdir="/tmp/wihost"
+mkdir -p $confdir
+
+
+
+#Variables de ejecucion
+
+nmapfile="$confdir/nmap.log"
+logfile="$confdir/wihost.log"
+pidfile="$confdir/wihost.pid"
+logfilescript="$confdir/script.log"
+startinterface="$confdir/confnameinterface.conf"
+
+macpc="$confdir/macpc.log"
+npc="$confdir/npc.log"
+
+#Variables de configuracion
+
+hotspotconfig="/etc/hostapd-hotspot.conf"
+dnsmasqconfig="/etc/dnsmasq.conf"
+startinterfaceconf="/etc/confnameinterface.conf"
+
+#Usuario y Contrasena
+SSID="myhotspot1-8"
+WPAPASS="12345678"
+
+#Fichero permanente que guarda las mac y nombres de PC
+mkdir -p "/home/$user/.local/share/wihost"
+macregistro="/home/$user/.local/share/wihost/macname.bd"
+
+#Recargar variables guardadas
+get_vars() {
+# Run Configuration Wizard if config files don't exist
+[[ ! -f "$hotspotconfig" || ! -f "$dnsmasqconfig" ]] && configure
+# Get $INTERFACE_NET and $INTERFACE_WLAN from the config files
+INTERFACE_WLAN=$(grep "interface" "$hotspotconfig" | sed -e 's/interface=//g')
+INTERFACE_NET=$(grep "INTERFACE_NET" "$dnsmasqconfig" | sed -e 's/#INTERFACE_NET=//g')
+SSID=$(grep "^ssid" "$hotspotconfig" | sed -n -e  's/ssid=*//p')
+WPAPASS=$(grep "^wpa_passphrase" "$hotspotconfig" | sed  -n -e  's/wpa_passphrase=*//p')
+}
+
+interface_comienzo(){
+ echo "$(grep "interface" "$hotspotconfig" | sed -e 's/interface=//g')" > "$startinterface"
+
+ if [[  -f $startinterfaceconf ]]; then
+  show_info "Las nubes Azules"
+  echo  "$(cat "$startinterfaceconf")" > "$startinterface"
+fi
+}
+
+interface_fin(){
+INTERFACE_WLAN=$(cat "$startinterface")
+guardar_conf
+show_msg "Restablecida $INTERFACE_WLAN"
+
+}
+
+
+#Verificar la existencia del comando service
+if command -v service > /dev/null; then
+    UPSTART_EXISTS="yes"
+else
+    UPSTART_EXISTS=
+fi
+
+#Verificar la existencia del comando route,ifconfig
+if command -v route > /dev/null; then
+    IFCONFIG_EXISTS="yes"
+else
+    IFCONFIG_EXISTS=
+fi
+
+
+
+#Mensajes para la consola
+show_msg() {
+echo -e "$@"
+}
+
+show_info() {
+echo -e "\033[1;34m$@\033[0m"
+}
+
+show_warn() {
+echo -e "\033[1;32m$@\033[0m"
+}
+
+show_err() {
+echo -e "\033[1;38m$@\033[0m" 1>&2
+}
+
+show_debug() {
+while read input; do
+	[[ "$debug" ]] && echo -e "$input"
+done
+}
+
+show_in_log(){
+
+	echo "$@" >> $logfilescript
+
+	}
+
+#Fin de mensajes para la consola
+#Mensaje en OSD de pantalla
+show_notify() {
+#sudo -u "$user" notify-send -h int:transient:1 -i "network-wireless" "$@"
+su $user -s /bin/bash -c "${DBUS} notify-send -h int:transient:1 -i \"network-wireless\" \"$@\""
+}
+
+
+check_root() {
+# Check if user is root
+if [[ ! $(whoami) = "root" ]]; then
+	show_err "Por Favor Inicie el Script como root, sudo wihost"
+	exit 1
+fi
+}
+
+check_supported() {
+# Check if the wireless card supports Access Point mode. This script won't work if it doesn't support it
+if [[ ! $(iw list 2>&1 | grep -A6 "Supported interface modes" | grep AP$) ]]; then
+	show_err "Tu tarjeta de wify no soporta Acces Point Mode"
+	exit 1
+fi
+}
+
+check_network() {
+# Check if Wireless is disabled
+if [[ $(iwconfig "$INTERFACE_WLAN" 2>&1 | grep "Tx-Power=off") ]]; then
+	show_err "La Wify esta detenida"
+	exit 1
+# Check if Wireless is enabled, but connected to a network
+elif [[ ! $(iwconfig "$INTERFACE_WLAN" 2>&1 | grep "ESSID:off/any") && $(iwconfig "$INTERFACE_WLAN" 2>&1 | grep "ESSID:") ]]; then
+	show_err "Informacion: Estas conectado a la red wify"
+fi
+}
+
+#Enumeracion de clientes
+escanear_red_wify(){
+
+	#Limpiar temporales
+	rm -f "$nmapfile"
+	rm -f "$npc"
+    rm -f "$macpc"
+
+	touch "$nmapfile"
+
+	#Echar un ojo para ver quien se ha conectado
+	nmap -sP 192.168.150.2-10  > "$nmapfile"
+
+	#Filtrar los nombres de PC
+	touch "$npc"
+	awk '/Nmap scan report for / {print $5}'  "$nmapfile" > "$npc"
+
+	#Filtrar las Mac por PC
+	        touch "$macpc"
+	awk '/MAC Address:/ {print $3}'   "$nmapfile" > "$macpc"
+
+	}
+
+# Registro de Nombres con Mac
+historial_pc(){
+
+          [[ ! -f "$macregistro" ]] &&  echo  "MAC::Nombre" > "$macregistro"
+
+	      cont=1
+	      bool="1"
+
+
+	      for mac in $(cat $macpc)
+	      do
+
+	     show_in_log "Objeto $mac"
+
+         for line in $(cat $macregistro | awk '{print $1}')
+		  do
+
+		# show_in_log "Objetivo $line"
+
+		  if [[ "$line" = "$mac" ]] ; then
+		  bool="0"
+		  fi
+		  done
+
+          verdadero=0
+
+         if [[ $bool>$verdadero ]]; then
+
+          datos=$(cat $npc | awk 'NR =='$cont)
+
+	     echo "$mac $datos" >> "$macregistro"
+
+          show_in_log "Registrando $datos"
+
+         else
+
+          show_in_log "Ya es registrado"
+
+         fi
+
+          bool="1"
+	      let cont=cont+1
+	      done
+	  }
+
+
+#Control entrada salida
+pasarela(){
+
+
+	  #Variable para ultima mac registrada entrada
+
+	   	connected=$(awk '/AP-STA-CONNECTED/ {print $3}'  "$logfile" | tail -1 |awk  '{print $1}' | tr  [:lower:]  [:upper:])
+
+	  #Ciclo para comparar un ficheo con el otro y mostrar el resultado esperado
+
+
+	      cont=1
+
+	      for i in $(cat $macregistro | awk '{print $1}')
+	      do
+	      	      datos=$(cat  $macregistro | awk '{print $2}' | awk 'NR=='$cont )
+
+
+	                if [[ $connected = $i ]]; then
+
+
+	            if [[ $1>0 ]]; then
+	             accion="se ha unido a la wify"
+
+	             else
+	             accion="se ha marchado de la wify"
+
+	             fi
+	    	     show_notify "$datos $accion"
+	    	       show_in_log "Correcto $datos $accion"
+	     fi
+
+
+
+	      let cont=cont+1
+	      done
+
+	}
+
+
+
+
+check_connected() {
+
+# Monitor de dispositivos conectados y desconectados
+lines_con="0"
+lines_dis="0"
+
+while [[ -e "$logfile" ]]; do
+
+        escanear_red_wify
+
+    if [[ "$lines_con" < $(grep -c "AP-STA-CONNECTED" "$logfile") ]]; then
+
+        historial_pc
+        pasarela 1
+		(( lines_con++ ))
+
+	elif [[ "$lines_dis" < $(grep -c "AP-STA-DISCONNECTED" "$logfile") ]]; then
+
+		historial_pc
+		pasarela 0
+		(( lines_dis++ ))
+
+	fi
+	sleep 5
+done
+
+}
+
+check_pid(){
+#Checkear que el programa no este ejecutado
+	if [[ -e "$pidfile" ]];
+    then
+	show_err "No es permisible ejecutar dos instancias del mismo proceso, Sugerencia: sudo wihost stop"
+	exit 1
+fi
+	}
+
+
+hard_w(){
+	#Muestra disponibilidad de interfaces
+	echo "Aqui tiene una lista, de hardware disponible"
+	echo "$(iwconfig  2>&1 |grep no | awk '{print $1}')"
+	echo  "$(iwconfig  2>&1 |grep IEEE | awk '{print $1}')"
+	}
+
+guardar_conf(){
+
+	# Write the hostapd config file
+cat <<EOF | tee "$hotspotconfig" > /dev/null 2>&1
+# WiFi Hotspot
+interface=$INTERFACE_WLAN
+driver=nl80211
+#Access Point
+ssid=$SSID
+hw_mode=g
+# WiFi Channel:
+channel=11
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+wpa=2
+wpa_passphrase=$WPAPASS
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=TKIP
+rsn_pairwise=CCMP
+EOF
+
+# Add the required bits to the dnsmasq config file
+if [[ ! $(grep "Bind to only one interface" "$dnsmasqconfig" > /dev/null 2>&1) ]]; then
+cat <<EOF | tee "$dnsmasqconfig" > /dev/null 2>&1
+# Bind to only one interface
+bind-interfaces
+# Choose interface for binding
+interface=$INTERFACE_WLAN
+# Specify range of IP addresses for DHCP leases
+dhcp-range=192.168.150.2,192.168.150.10,12h
+#INTERFACE_NET=$INTERFACE_NET
+EOF
+chmod +x "$dnsmasqconfig"
+	fi
+	}
+
+configure() {
+# Check root
+check_root
+# Check supported
+check_supported
+# Reset config
+rm -f "$hotspotconfig"
+rm -f "$dnsmasqconfig"
+# Detect configuration
+show_err "Detectando configuracion..."
+
+#Figuring out Default Interent Interface
+if command -v route > /dev/null; then
+    INTERFACE_NET=$(route | grep -iw "default" | awk '{print $NF}')
+elif command -v ip > /dev/null; then
+    INTERFACE_NET=$(ip route | grep -iw "default" | awk '{print $5}')
+fi
+
+#Figuring out Wireless Interface
+if command -v iwconfig > /dev/null; then  #Checking presence of iwconfig
+    INTERFACE_WLAN=$(iwconfig 2>&1 | grep "^wlan" | sed -e 's/ .*//g' | tail -n 1) #Assuming interface uses old wlan convention
+    if [[ ! $INTERFACE_WLAN ]]; then
+        INTERFACE_WLAN=$(iwconfig 2>&1 | grep "^wlp" | sed -e 's/ .*//g' | tail -n 1)  #Assuming interface uses new wlp convention
+    fi
+elif command -v iw > /dev/null; then
+    INTERFACE_WLAN=$(iw dev 2>&1 | grep "Interface" | awk '{print $2}' | tail -n 1)
+    if [[ ! $INTERFACE_WLAN ]]; then
+        INTERFACE_WLAN=$(iwconfig 2>&1 | grep "^wlp" | sed -e 's/ .*//g' | tail -n 1)
+    fi
+fi
+
+# Interfaz de red conectada a internet puede ser ethernet como wify
+clear
+if [[ ! $INTERFACE_NET ]]; then
+	show_err "Interface de internet no detectada. "
+	show_err "Se utilizara eth0 por defecto. Presione ENTER si esta de acuerdo"
+	interface_net="eth0"
+	hard_w
+else
+	show_err  "Detectada $INTERFACE_NET ."
+	show_info "Como interface de red con internet. "
+	show_err  "Presione ENTER si esta de acuerdo."
+	show_info "Si no que interface usa para conectarse a Internet."
+	hard_w
+fi
+read interface_net
+[[ "$interface_net" ]] && INTERFACE_NET="$interface_net"
+
+
+
+# WiFi interface  para crear acces point
+clear
+if [[ ! $INTERFACE_WLAN ]]; then
+    show_err "Interface de Wify no detectada"
+    show_err "Se utilizara wlan0 por defecto. Presione ENTER si esta de acuerdo"
+	interface_wlan="wlan0"
+	show_err "Lista de hardware wify del pc"
+	echo  "$(iwconfig  2>&1 |grep IEEE | awk '{print $1}')"
+else
+   show_err   "Detectada $INTERFACE_WLAN ."
+	show_info "Como interface de red con soporte Wify. "
+	show_err  "Presione ENTER si esta de acuerdo."
+	show_info "Si no, que interface usa para crear el Access Point."
+	show_err "Lista de hardware wify del pc"
+	echo  "$(iwconfig  2>&1 |grep IEEE | awk '{print $1}')"
+
+fi
+read interface_wlan
+[[ "$interface_wlan" ]] && INTERFACE_WLAN="$interface_wlan"
+
+
+# Hotspot SSID
+clear
+show_err "Prefiere ($SSID):"
+show_info "En caso negativo escriba un nick preferido:"
+read ssid
+[[ "$ssid" ]] && SSID="$ssid"
+
+# WPA Passphrase
+   while :; do
+   show_err "Usar por defecto el pasword $WPAPASS:"
+   show_info "En caso negativo escriba con + 8 caracteres una contrasena"
+   read wpapass
+ if [[ ${#wpapass} -gt 0 && ${#wpapass} -lt 8 ]] || [[ ${#wpapass} -gt 63 ]]; then
+                    echo "ERROR: Contrasena longitud invalida ${#wpapass} (esperado 8..63)" >&2
+                    sleep 1
+                    clear
+                    continue
+                   fi
+              break
+           done
+
+[[ "$wpapass" ]] && WPAPASS="$wpapass"
+
+#Anadir funcion para compartir sin contrasena
+
+guardar_conf
+
+show_err "Configuracion terminada"
+}
+
+
+check_hostapd(){
+	HOSTAPD=$(which hostapd)
+
+if [[ ! -x "$HOSTAPD" ]]; then
+    show_in_log "ERROR: hostapd not found installed." >&2
+    show_err "ERROR: hostapd not found installed." >&2
+    exit 1
+fi
+}
+
+
+#Codigo fuente para crear una interface wify virtual
+source ./virtual_device.sh
+
+#Iniciar todo el proceso de wihost
+
+start() {
+#Chech Hostpad
+check_hostapd
+# Check root
+check_root
+# Check previous process
+check_pid
+# Check supported
+check_supported
+# Get variables
+get_vars
+# Check network
+check_network
+#Save interface wify original
+
+interface_comienzo
+
+show_err "Iniciando Punto de Acceso"
+show_err "     $SSID        "
+show_err "Pasword:  $WPAPASS "
+
+# Set up the interface
+
+nmcli radio wifi off
+rfkill unblock wlan
+
+# Set up the services
+
+if [[ $UPSTART_EXISTS ]]; then
+    service hostapd stop 2>&1 | show_in_log
+    service dnsmasq stop 2>&1 | show_in_log
+    update-rc.d hostapd disable 2>&1 | show_in_log
+    update-rc.d dnsmasq disable 2>&1 | show_in_log
+else
+    systemctl stop hostapd 2>&1 | show_in_log
+    systemctl stop dnsmasq 2>&1 | show_in_log
+    systemctl disable hostapd 2>&1 | show_in_log
+    systemctl disable dnsmasq 2>&1 | show_in_log
+fi
+
+# Write the PID to a file
+echo "$$" > "$pidfile"
+
+#Crear punto de acceso virtual#######
+
+show_in_log "Interface wify $startinterface"
+
+crear_virtual_wify 0
+
+INTERFACE_WLAN=$(cat "$confdir/interfacevirtual.id")
+
+show_in_log "Interface Virtual: $INTERFACE_WLAN"
+
+########################################
+#######Gardar Cambios del Momento#######
+guardar_conf
+#
+########################################
+
+show_info "Estableciendo IP wlan..."
+
+# Configure IP address for WLAN
+if [[ $IFCONFIG_EXISTS ]]; then
+    ifconfig "$INTERFACE_WLAN" 192.168.150.1 2>&1 | show_in_log
+
+else #using ip command
+    ip addr flush dev "$INTERFACE_WLAN" 2>&1 | show_in_log
+    ip addr add 192.168.150.1 dev "$INTERFACE_WLAN" 2>&1 | show_in_log
+fi
+
+
+show_info "Iniciando DNS..."
+# Start DHCP/DNS server
+if [[ $UPSTART_EXISTS ]]; then
+    service dnsmasq restart 2>&1 | show_in_log
+else
+    systemctl restart dnsmasq 2>&1 | show_in_log
+fi
+
+
+show_info "Configurando Iptables..."
+
+# Enable routing
+sysctl net.ipv4.ip_forward=1 2>&1 | show_in_log
+# Enable NAT
+iptables -t nat -A POSTROUTING -o "$INTERFACE_NET" -j MASQUERADE 2>&1 | show_in_log
+
+show_info "Iluminando con Wify"
+# Run access point daemon
+ if [[ $(hostapd --help 2>&1 | grep "\-f") ]]; then
+	rm -f "$logfile"
+	touch "$logfile"
+	show_info "Configurando HostApd..."
+	hostapd -B "$hotspotconfig" -f "$logfile"
+	show_info "Iniciado HostApd..."
+
+	    #En caso de encontrar un error critico todo.
+	    ERROR=$(grep "^nl80211:" "$logfile" | sed  -n  -e  's/nl80211:*//p')
+	  if [[ "$ERROR" == " Could not configure driver mode" ]]; then
+         show_err "Si desea reiniciar el access point debe reiniciar la PC ..."
+          exit 1
+      fi
+
+while :
+	do
+		[[ $(grep "Using interface" "$logfile") ]] && show_info "Wireless Hotspot active" && show_notify "Wireless Hotspot active" && break
+		sleep 5
+	done
+
+	check_connected 2>&1 &
+	disown
+else
+	hostapd  "$hotspotconfig" 2>&1 | show_in_log
+	show_info "Wireless Hotspot active"
+
+fi
+
+
+echo "$(cat "$startinterface")"  >  "$startinterfaceconf"
+}
+
+#Cerrar el proceso de wihost  STOP
+
+stop() {
+# Check root
+check_root
+# Get variables
+get_vars
+# Kill process
+show_info "Deteniendo Wireless Hotspot..."
+
+if [[ -e "$pidfile" ]]; then
+
+# Disable NAT
+iptables -D POSTROUTING -t nat -o "$INTERFACE_NET" -j MASQUERADE 2>&1 | show_in_log
+# Disable routing
+sysctl net.ipv4.ip_forward=0 2>&1 | show_in_log
+
+# Set up the services
+if [[ $UPSTART_EXISTS ]]; then
+    service hostapd stop 2>&1 | show_in_log
+    service dnsmasq stop 2>&1 | show_in_log
+    update-rc.d hostapd disable 2>&1 | show_in_log
+    update-rc.d dnsmasq disable 2>&1 | show_in_log
+else
+    systemctl stop hostapd 2>&1 | show_in_log
+    systemctl stop dnsmasq 2>&1 | show_in_log
+    systemctl disable hostapd 2>&1 | show_in_log
+    systemctl disable dnsmasq 2>&1 | show_in_log
+fi
+
+
+ #kill nmap process
+  pid=$(pidof -s nmap)
+  [[  $pid ]] && kill -9 $pid  | show_in_log
+ #kill dnsmasq process
+  pid=$(pidof -s dnsmasq)
+  [[  $pid ]] && kill -9 $pid  | show_in_log
+ #kill hostapd process
+  pid=$(pidof -s hostapd)
+  [[  $pid ]] && kill -9 $pid  | show_in_log
+
+
+ # kill processes
+  #  for x in $confdir/*.pid; do
+        # even if the $CONFDIR is empty, the for loop will assign
+        # a value in $x. so we need to check if the value is a file
+     #   [[ -f $x ]] && kill -9 $(cat $x)
+   # done
+
+
+#Borrado de la interface virtual
+
+eliminar_virtual_wify  0
+
+nmcli radio wifi off
+rfkill unblock wlan
+
+interface_fin
+
+show_err "Limpiado con Exito  "
+
+
+#Borrado Total
+rm -r -d $confdir
+
+fi
+
+show_err "Ok"
+
+}
+
+
+restart() {
+show_info "Reiniciando Wireless Hotspot..."
+stop
+sleep 3
+mkdir -p $confdir
+start
+}
+
+exportconf(){
+	check_root
+	dir="/home/$user"
+	show_err "Exportar en la carpeta personal, o especifique donde"
+	read DIR
+	[[ ! DIR ]] && dir=$DIR
+
+	cp  $macregistro $dir
+	chmod 666 $dir/macname.bd
+	echo "OK"
+	if [[ ! -e "$pidfile" ]];
+    then
+	rm -r -d $confdir
+	fi
+	}
+
+importconf(){
+	check_root
+	dir="/home/$user"
+	show_err "Importar en la carpeta personal, o especifique donde"
+	read DIR
+	[[ ! DIR ]] && dir=$DIR
+
+	cp   $dir/macname.bd  $macregistro
+	echo "OK"
+
+	if [[ ! -e "$pidfile" ]];
+    then
+	rm -r -d $confdir
+	fi
+
+	}
+
+
+case "$1" in
+	start)
+
+	       start
+	       ;;
+	stop)
+		   stop;;
+	restart)
+			restart;;
+
+	saveconf)
+			exportconf;;
+
+    loadconf)
+			importconf;;
+
+	configure)
+
+			configure;;
+	debug)
+			debug="true"
+			start;;
+	*)
+
+	       show_info "Uso:   sudo wihost [argumentos]   "
+	       show_info "argumentos:  ""start"  "stop"   "configure" "debug"  "saveconf" "loadconf"
+	 	   show_info "Comience con:   sudo wihost start"
+
+			exit;;
+esac
